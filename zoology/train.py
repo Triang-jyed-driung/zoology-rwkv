@@ -143,11 +143,29 @@ class Trainer:
 
     def fit(self):
         self.model.to(self.device)
+        model_dim = self.model.backbone.embeddings.word_embeddings.weight.shape[1]
+        param_groups = [
+            # {
+            #     'params': [p for n, p in self.model.named_parameters() if 'att.w0' in n],
+            #     'weight_decay': 0.0,
+            #     'lr': 2*self.learning_rate,
+            # },
+            {
+                'params': [p for n, p in self.model.named_parameters() if p.numel() > model_dim],
+                'weight_decay': self.weight_decay,
+                'lr': self.learning_rate,
+            },
+            {
+                'params': [p for n, p in self.model.named_parameters() if p.numel() <= model_dim],
+                'weight_decay': 0.0,  # No weight decay for these parameters
+                'lr': self.learning_rate,
+            }
+        ]
         self.loss_fn = nn.CrossEntropyLoss()
         self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
+            param_groups,
             weight_decay=self.weight_decay,
+            eps=1e-18,
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=self.max_epochs, eta_min=0.0

@@ -73,11 +73,16 @@ class TokenEmbeddings(nn.Module):
 def _init_weights(
     module,
     n_layers,
-    block_type,
+    block_type: str,
     initializer_range=0.02,
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
+    if 'rwkv7' in block_type.lower():
+        if isinstance(module, nn.Embedding):
+            nn.init.uniform_(module.weight, a=-0.02, b=0.02)
+        return
+
     if 'Mamba' in block_type:
         if isinstance(module, nn.Linear):
             if module.bias is not None:
@@ -125,6 +130,36 @@ def _init_weights(
                         p, mean=0.0, std=initializer_range / math.sqrt(2 * n_layers)
                     )
 
+class RWKV7Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.args = config
+        self.layer_idx = layer_idx
+        self.v_first = None
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.ln2 = nn.LayerNorm(config.d_model)
+        if self.layer_idx == 0:
+            self.ln0 = nn.LayerNorm(config.d_model)
+        self.att = config.sequence_mixer.instantiate(
+            args=config,
+            layer_id=layer_idx,
+        )
+        self.ffn = config.state_mixer.instantiate(
+            args=config,
+            layer_id=layer_idx,
+        )
+        if config.resid_dropout > 0:
+            self.drop0 = nn.Dropout(p = config.resid_dropout)
+            self.drop1 = nn.Dropout(p = config.resid_dropout)
+
+    def forward(self, x, v_first):
+        if self.layer_idx == 0:
+            x = self.ln0(x)
+        x_attn, v_first = self.att(self.ln1(x), v_first)
+        x = x + x_attn
+        x = x + self.ffn(self.ln2(x))
+        return x, v_first
+
 
 class TransformerBlock(nn.Module):
 
@@ -169,6 +204,9 @@ class LMBackbone(nn.Module):
             config.max_position_embeddings,
             learnable=config.learnable_word_embeddings
         )
+        self.config = config
+        if config.block_type == 'RWKV7Block':
+            block_cls = RWKV7Block
         if config.block_type == 'TransformerBlock':
             block_cls = TransformerBlock
         elif config.block_type == 'MambaBlock':
@@ -188,17 +226,26 @@ class LMBackbone(nn.Module):
         self.apply(partial(_init_weights, n_layers=config.n_layers, block_type=config.block_type))
 
     def forward(self, input_ids, position_ids=None):
-        hidden_states = self.embeddings(
-            input_ids,
-            position_ids=position_ids,
-        )
-        residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(hidden_states, residual)
-        dropped = self.drop_f(hidden_states)
-        residual = (dropped + residual) if residual is not None else dropped
-        hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
-        return hidden_states
+        if self.config.block_type == 'RWKV7Block':
+            x = self.embeddings(input_ids, position_ids=None)
+            v_first = torch.empty_like(x)
+            for layer in self.layers:
+                x, v_first = layer(x, v_first)
+            residual = self.drop_f(x)
+            hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
+            return hidden_states
+        else:
+            hidden_states = self.embeddings(
+                input_ids,
+                position_ids=position_ids,
+            )
+            residual = None
+            for layer in self.layers:
+                hidden_states, residual = layer(hidden_states, residual)
+            dropped = self.drop_f(hidden_states)
+            residual = (dropped + residual) if residual is not None else dropped
+            hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
+            return hidden_states
 
 
 class LanguageModel(nn.Module):
